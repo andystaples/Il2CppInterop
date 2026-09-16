@@ -217,7 +217,7 @@ internal unsafe class Il2CppDetourMethodPatcher : MethodPatcher
 
         var returnSize = IntPtr.Size;
 
-        var isReturnValueType = managedReturnType.IsSubclassOf(typeof(ValueType));
+        var isReturnValueType = IsWrappedValueType(managedReturnType);
         if (isReturnValueType)
         {
             uint align = 0;
@@ -300,9 +300,31 @@ internal unsafe class Il2CppDetourMethodPatcher : MethodPatcher
                 continue;
             }
 
-            il.Emit(OpCodes.Ldarg_S, i + paramStartIndex);
-            il.Emit(OpCodes.Ldloc, indirectVariables[i]);
             var directType = managedParams[i].GetElementType();
+            il.Emit(OpCodes.Ldarg_S, i + paramStartIndex);
+
+            if (IsWrappedValueType(directType))
+            {
+                // The managed method was handed a boxed copy, since a wrapped value type cannot alias the
+                // caller's storage; copy the box back over that storage, the same way a returned struct is
+                // copied into the caller's return buffer below.
+                //
+                // This copy carries no GC write barrier. il2cpp exports only a single field barrier and no
+                // range form, so where the caller's storage is inside a managed heap object, references the
+                // struct carries can be missed by an incremental mark already in progress.
+                uint align = 0;
+                var valueSize = IL2CPP.il2cpp_class_value_size(
+                    Il2CppClassPointerStore.GetNativeClassPointer(directType), ref align);
+
+                il.Emit(OpCodes.Ldloc, indirectVariables[i]);
+                il.Emit(OpCodes.Call, ObjectBaseToPtrNotNullMethodInfo);
+                EmitUnbox(il);
+                il.Emit(OpCodes.Ldc_I4, valueSize);
+                il.Emit(OpCodes.Cpblk);
+                continue;
+            }
+
+            il.Emit(OpCodes.Ldloc, indirectVariables[i]);
             EmitConvertManagedTypeToIL2CPP(il, directType);
             il.Emit(StIndOpcodes.TryGetValue(directType, out var stindOpCodde) ? stindOpCodde : OpCodes.Stind_I);
         }
@@ -317,23 +339,53 @@ internal unsafe class Il2CppDetourMethodPatcher : MethodPatcher
         {
             if (hasReturnBuffer)
             {
+                // This runs after the catch block, so the return is null whenever the managed method threw
+                var returnBufferEmpty = il.DefineLabel();
+                var returnBufferFilled = il.DefineLabel();
+
+                il.Emit(OpCodes.Ldloc, managedReturnVariable);
+                il.Emit(OpCodes.Brfalse, returnBufferEmpty);
+
                 il.Emit(OpCodes.Ldarg_0);
                 il.Emit(OpCodes.Ldloc, managedReturnVariable);
                 il.Emit(OpCodes.Call, ObjectBaseToPtrNotNullMethodInfo);
                 EmitUnbox(il);
                 il.Emit(OpCodes.Ldc_I4, returnSize);
                 il.Emit(OpCodes.Cpblk);
+                il.Emit(OpCodes.Br, returnBufferFilled);
+
+                il.MarkLabel(returnBufferEmpty);
+                il.Emit(OpCodes.Ldarg_0);
+                il.Emit(OpCodes.Ldc_I4_0);
+                il.Emit(OpCodes.Ldc_I4, returnSize);
+                il.Emit(OpCodes.Initblk);
+
+                il.MarkLabel(returnBufferFilled);
 
                 // Return the same pointer to the return buffer
                 il.Emit(OpCodes.Ldarg_0);
             }
             else if (TrampolineHelpers.IsPassedByValue(managedReturnType))
             {
-                // A small struct goes back in a register, so the boxed payload is copied out as the fixed size struct
+                // A small struct goes back in a register, so the boxed payload is copied out as the fixed size
+                // struct. Same as above, a throwing patch leaves nothing to copy and has to yield a zeroed value.
+                var registerValue = il.DeclareLocal(unmanagedReturnType);
+                var registerValueSet = il.DefineLabel();
+
+                il.Emit(OpCodes.Ldloca, registerValue);
+                il.Emit(OpCodes.Initobj, unmanagedReturnType);
+
+                il.Emit(OpCodes.Ldloc, managedReturnVariable);
+                il.Emit(OpCodes.Brfalse, registerValueSet);
+
                 il.Emit(OpCodes.Ldloc, managedReturnVariable);
                 il.Emit(OpCodes.Call, ObjectBaseToPtrNotNullMethodInfo);
                 EmitUnbox(il);
                 il.Emit(OpCodes.Ldobj, unmanagedReturnType);
+                il.Emit(OpCodes.Stloc, registerValue);
+
+                il.MarkLabel(registerValueSet);
+                il.Emit(OpCodes.Ldloc, registerValue);
             }
             else
             {
@@ -383,45 +435,12 @@ internal unsafe class Il2CppDetourMethodPatcher : MethodPatcher
     {
         variable = null;
 
-        bool needsBoxing = managedParamType.IsSubclassOf(typeof(ValueType));
+        bool needsBoxing = IsWrappedValueType(managedParamType);
 
         if (needsBoxing)
         {
-            var classPtr = Il2CppClassPointerStore.GetNativeClassPointer(managedParamType);
-
-            // il2cpp_value_box uses .NET boxing semantics which boxes Nullable<T> as just T,
-            // losing the HasValue field. Manually box Nullable<T> to preserve full data.
-            bool isNullable = managedParamType.IsGenericType &&
-                managedParamType.GetGenericTypeDefinition().FullName == "Il2CppSystem.Nullable`1";
-
-            if (isNullable)
-            {
-                uint align = 0;
-                var valueSize = IL2CPP.il2cpp_class_value_size(classPtr, ref align);
-
-                il.Emit(OpCodes.Ldc_I8, classPtr.ToInt64());
-                il.Emit(OpCodes.Conv_I);
-                il.Emit(OpCodes.Call, AccessTools.Method(typeof(IL2CPP), nameof(IL2CPP.il2cpp_object_new)));
-                var objLocal = il.DeclareLocal(typeof(IntPtr));
-                il.Emit(OpCodes.Stloc, objLocal);
-                il.Emit(TrampolineHelpers.IsPassedByValue(managedParamType) ? OpCodes.Ldarga_S : OpCodes.Ldarg, argIndex);
-                il.Emit(OpCodes.Ldloc, objLocal);
-                il.Emit(OpCodes.Call, AccessTools.Method(typeof(IL2CPP), nameof(IL2CPP.il2cpp_object_unbox)));
-                il.Emit(OpCodes.Ldc_I4, (int)valueSize);
-                il.Emit(OpCodes.Call, AccessTools.Method(typeof(Il2CppDetourMethodPatcher), nameof(CopyMemory)));
-                il.Emit(OpCodes.Ldloc, objLocal);
-            }
-            else
-            {
-                // Box struct into object first before conversion
-                il.Emit(OpCodes.Ldc_I8, classPtr.ToInt64());
-                il.Emit(OpCodes.Conv_I);
-                // We don't handle byref structs on x86 yet but we're yet to encounter those
-                il.Emit(TrampolineHelpers.IsPassedByValue(managedParamType) ? OpCodes.Ldarga_S : OpCodes.Ldarg, argIndex);
-                il.Emit(OpCodes.Call,
-                    AccessTools.Method(typeof(IL2CPP),
-                        nameof(IL2CPP.il2cpp_value_box)));
-            }
+            EmitBoxWrappedValueType(il, managedParamType,
+                () => il.Emit(TrampolineHelpers.IsPassedByValue(managedParamType) ? OpCodes.Ldarga_S : OpCodes.Ldarg, argIndex));
         }
         else
         {
@@ -466,11 +485,30 @@ internal unsafe class Il2CppDetourMethodPatcher : MethodPatcher
         if (managedParamType.IsByRef)
         {
             var directType = managedParamType.GetElementType();
-            // blittable value type pointer, note that ref to boxed Il2CppSystem.ValueType wrapper is still not handled
+            // blittable value type pointer, it is already storage of the right shape and is passed straight through
             if (directType.IsValueType)
                 return;
 
-            // TODO: directType being Il2CppSystem.ValueType is not handled yet (but it's not that common in games). Implement when needed.
+            if (IsWrappedValueType(directType))
+            {
+                // A value type that isn't blittable is wrapped in a class, so the managed method has no way to
+                // alias the caller's storage. Box a copy of it on the way in; GenerateNativeToManagedTrampoline
+                // copies that box back over the caller's storage once the method has returned. Without this the
+                // pointer is read as though it were an object reference, which is neither the caller's value nor
+                // the right size.
+                var storage = il.DeclareLocal(typeof(IntPtr));
+
+                il.Emit(OpCodes.Stloc, storage);
+                EmitBoxWrappedValueType(il, directType, () => il.Emit(OpCodes.Ldloc, storage));
+
+                variable = il.DeclareLocal(directType);
+
+                HandleTypeConversion(directType);
+
+                il.Emit(OpCodes.Stloc, variable);
+                il.Emit(OpCodes.Ldloca, variable);
+                return;
+            }
 
             variable = il.DeclareLocal(directType);
 
@@ -486,6 +524,70 @@ internal unsafe class Il2CppDetourMethodPatcher : MethodPatcher
             HandleTypeConversion(managedParamType);
         }
     }
+
+    /// <summary>
+    ///     Whether il2cpp passes this type as a struct rather than as an object reference.
+    /// </summary>
+    /// <remarks>
+    ///     Il2CppSystem.Enum derives from the value type wrapper, because System.Enum derives from
+    ///     System.ValueType, yet il2cpp declares its class a reference and gives it no payload of its own.
+    ///     Deriving from the wrapper is therefore not the question to ask; what il2cpp says about the class is.
+    /// </remarks>
+    private static bool IsWrappedValueType(Type managedType)
+    {
+        if (!managedType.IsSubclassOf(typeof(ValueType)))
+            return false;
+
+        var classPtr = Il2CppClassPointerStore.GetNativeClassPointer(managedType);
+        return classPtr != IntPtr.Zero && IL2CPP.il2cpp_class_is_valuetype(classPtr);
+    }
+
+    /// <summary>
+    ///     Boxes the wrapped value type at the address <paramref name="emitValueAddress" /> pushes, leaving the
+    ///     box's pointer on the stack.
+    /// </summary>
+    /// <remarks>
+    ///     il2cpp_value_box is the path for every type it can represent, because Object::Box runs a GC write
+    ///     barrier over the payload it copies and a plain copy does not: an incremental mark already in progress
+    ///     could otherwise miss the references a struct carries. Nullable is the one type it cannot represent,
+    ///     since .NET boxing semantics turn a Nullable&lt;T&gt; into a bare T or null and so lose HasValue, and it
+    ///     has to allocate the box and copy the struct's own bytes instead.
+    /// </remarks>
+    private static void EmitBoxWrappedValueType(ILGenerator il, Type managedType, Action emitValueAddress)
+    {
+        var classPtr = Il2CppClassPointerStore.GetNativeClassPointer(managedType);
+
+        il.Emit(OpCodes.Ldc_I8, classPtr.ToInt64());
+        il.Emit(OpCodes.Conv_I);
+
+        if (!IsNullable(managedType))
+        {
+            emitValueAddress();
+            il.Emit(OpCodes.Call, AccessTools.Method(typeof(IL2CPP), nameof(IL2CPP.il2cpp_value_box)));
+            return;
+        }
+
+        uint align = 0;
+        var valueSize = IL2CPP.il2cpp_class_value_size(classPtr, ref align);
+
+        il.Emit(OpCodes.Call, AccessTools.Method(typeof(IL2CPP), nameof(IL2CPP.il2cpp_object_new)));
+        var box = il.DeclareLocal(typeof(IntPtr));
+        il.Emit(OpCodes.Stloc, box);
+
+        emitValueAddress();
+        il.Emit(OpCodes.Ldloc, box);
+        il.Emit(OpCodes.Call, AccessTools.Method(typeof(IL2CPP), nameof(IL2CPP.il2cpp_object_unbox)));
+        il.Emit(OpCodes.Ldc_I4, valueSize);
+        il.Emit(OpCodes.Call, AccessTools.Method(typeof(Il2CppDetourMethodPatcher), nameof(CopyMemory)));
+
+        il.Emit(OpCodes.Ldloc, box);
+    }
+
+    // A Nullable's HasValue lives outside what .NET boxing semantics carry, so it cannot go through
+    // il2cpp_value_box
+    private static bool IsNullable(Type managedType) =>
+        managedType.IsGenericType &&
+        managedType.GetGenericTypeDefinition().FullName == "Il2CppSystem.Nullable`1";
 
     private static void CopyMemory(IntPtr src, IntPtr dest, int size) =>
         Buffer.MemoryCopy(src.ToPointer(), dest.ToPointer(), size, size);
