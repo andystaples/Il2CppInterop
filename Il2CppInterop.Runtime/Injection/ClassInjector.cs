@@ -19,7 +19,6 @@ using Il2CppInterop.Runtime.Runtime.VersionSpecific.Class;
 using Il2CppInterop.Runtime.Runtime.VersionSpecific.MethodInfo;
 using Il2CppInterop.Runtime.Runtime.VersionSpecific.Type;
 using Microsoft.Extensions.Logging;
-using ValueType = Il2CppSystem.ValueType;
 using Void = Il2CppSystem.Void;
 
 namespace Il2CppInterop.Runtime.Injection;
@@ -1568,7 +1567,7 @@ public static unsafe partial class ClassInjector
         for (var i = 1; i < managedParameters.Length; i++)
         {
             var parameter = managedParameters[i];
-            if (parameter.IsSubclassOf(typeof(ValueType)))
+            if (TrampolineHelpers.IsWrappedStruct(parameter))
             {
                 body.Emit(OpCodes.Ldc_I8, Il2CppClassPointerStore.GetNativeClassPointer(parameter).ToInt64());
                 body.Emit(OpCodes.Conv_I);
@@ -1592,7 +1591,7 @@ public static unsafe partial class ClassInjector
                 {
                     body.Emit(OpCodes.Call, typeof(Il2CppObjectPool).GetMethod(nameof(Il2CppObjectPool.Get))!.MakeGenericMethod(type));
                 }
-                else if (type.IsSubclassOf(typeof(ValueType)))
+                else if (TrampolineHelpers.IsWrappedStruct(type))
                 {
                     // Struct values arrive in a box made above for this call alone
                     body.Emit(OpCodes.Call, typeof(Il2CppObjectBase).GetMethod(nameof(Il2CppObjectBase.WrapValueBox))!.MakeGenericMethod(type));
@@ -1781,7 +1780,7 @@ public static unsafe partial class ClassInjector
         // from that class. Neither reaches the native signature, which collapses bool onto byte and keeps only
         // a simple name, so no value type return can share an invoker.
         if (monoMethod.ReturnType != typeof(void) &&
-            (monoMethod.ReturnType.IsValueType || monoMethod.ReturnType.IsSubclassOf(typeof(ValueType))))
+            (monoMethod.ReturnType.IsValueType || TrampolineHelpers.IsWrappedStruct(monoMethod.ReturnType)))
             builder.Append(monoMethod.ReturnType.AssemblyQualifiedName);
         builder.Append(monoMethod.IsStatic ? "" : "This");
         foreach (var parameterInfo in monoMethod.GetParameters())

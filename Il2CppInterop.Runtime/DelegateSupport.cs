@@ -16,7 +16,6 @@ using Il2CppInterop.Runtime.InteropTypes.Arrays;
 using Il2CppInterop.Runtime.Runtime;
 using Microsoft.Extensions.Logging;
 using Object = Il2CppSystem.Object;
-using ValueType = Il2CppSystem.ValueType;
 
 namespace Il2CppInterop.Runtime;
 
@@ -169,7 +168,7 @@ public static class DelegateSupport
             {
                 bodyBuilder.Emit(OpCodes.Call, typeof(Il2CppObjectPool).GetMethod(nameof(Il2CppObjectPool.Get))!.MakeGenericMethod(parameterType));
             }
-            else if (parameterType.IsSubclassOf(typeof(ValueType)))
+            else if (TrampolineHelpers.IsWrappedStruct(parameterType))
             {
                 // A wrapped struct arrives as its data, not as a box the wrapper could point at
                 bodyBuilder.Emit(OpCodes.Pop);
@@ -337,7 +336,7 @@ public static class DelegateSupport
             throw new ArgumentException($"{il2CppDelegateClrType} is not a delegate");
 
         var managedInvokeMethod = managedDelegateType.GetMethod("Invoke")!;
-        if (managedInvokeMethod.ReturnType.IsSubclassOf(typeof(ValueType)))
+        if (TrampolineHelpers.IsWrappedStruct(managedInvokeMethod.ReturnType))
             throw new ArgumentException(
                 $"Delegate returns {managedInvokeMethod.ReturnType} (non-blittable struct) which is not supported");
 

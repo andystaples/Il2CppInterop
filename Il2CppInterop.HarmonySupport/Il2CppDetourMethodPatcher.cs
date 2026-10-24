@@ -14,7 +14,6 @@ using Il2CppInterop.Runtime.Startup;
 using Microsoft.Extensions.Logging;
 using MonoMod.Cil;
 using MonoMod.Utils;
-using ValueType = Il2CppSystem.ValueType;
 using Void = Il2CppSystem.Void;
 
 namespace Il2CppInterop.HarmonySupport;
@@ -275,7 +274,7 @@ internal unsafe class Il2CppDetourMethodPatcher : MethodPatcher
 
         var returnSize = IntPtr.Size;
 
-        var isReturnValueType = managedReturnType.IsSubclassOf(typeof(ValueType));
+        var isReturnValueType = TrampolineHelpers.IsWrappedStruct(managedReturnType);
         if (isReturnValueType)
         {
             uint align = 0;
@@ -572,7 +571,7 @@ internal unsafe class Il2CppDetourMethodPatcher : MethodPatcher
     {
         variable = null;
 
-        bool needsBoxing = managedParamType.IsSubclassOf(typeof(ValueType));
+        bool needsBoxing = TrampolineHelpers.IsWrappedStruct(managedParamType);
 
         if (needsBoxing)
         {
@@ -611,7 +610,7 @@ internal unsafe class Il2CppDetourMethodPatcher : MethodPatcher
 
             il.MarkLabel(notNullLabel);
             // A struct argument sits in a box made above for this call alone, which a pool lookup would only miss
-            il.Emit(OpCodes.Call, originalType.IsSubclassOf(typeof(ValueType))
+            il.Emit(OpCodes.Call, TrampolineHelpers.IsWrappedStruct(originalType)
                 ? AccessTools.Method(typeof(Il2CppObjectBase), nameof(Il2CppObjectBase.WrapValueBox)).MakeGenericMethod(originalType)
                 : AccessTools.Method(typeof(Il2CppObjectPool), nameof(Il2CppObjectPool.Get)).MakeGenericMethod(originalType));
 

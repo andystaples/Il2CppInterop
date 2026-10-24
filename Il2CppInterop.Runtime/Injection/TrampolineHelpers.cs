@@ -33,6 +33,17 @@ internal static class TrampolineHelpers
         }
     }
 
+    // Il2CppSystem.Enum derives from the struct wrapper, as System.Enum derives from System.ValueType, yet il2cpp
+    // declares it a reference class with no payload of its own. Deriving from the wrapper does not make a struct,
+    // il2cpp's own answer for the class does. A class not resolved yet keeps the answer the derivation gives.
+    internal static bool IsWrappedStruct(Type managedType)
+    {
+        if (!managedType.IsSubclassOf(typeof(Il2CppSystem.ValueType)))
+            return false;
+        var classPtr = Il2CppClassPointerStore.GetNativeClassPointer(managedType);
+        return classPtr == IntPtr.Zero || IL2CPP.ClassIsValueType(classPtr);
+    }
+
     internal static int ValueSize(Type managedType)
     {
         uint align = 0;
@@ -43,7 +54,7 @@ internal static class TrampolineHelpers
     // rest through a pointer, other 64 bit ABIs stay pointers.
     internal static bool IsPassedByValue(Type managedType)
     {
-        if (!managedType.IsSubclassOf(typeof(Il2CppSystem.ValueType)))
+        if (!IsWrappedStruct(managedType))
             return false;
         if (!Environment.Is64BitProcess)
             return true;
@@ -56,14 +67,14 @@ internal static class TrampolineHelpers
     // A struct wrapper not returned in a register comes back through a caller allocated buffer passed as the first argument
     internal static bool NeedsReturnBuffer(Type returnType)
     {
-        return returnType.IsSubclassOf(typeof(Il2CppSystem.ValueType)) && !IsPassedByValue(returnType);
+        return IsWrappedStruct(returnType) && !IsPassedByValue(returnType);
     }
 
     // A byref to a boxed struct wrapper points at the struct's bytes, not at an object. The wrapper needs a box of
     // its own, so the bytes are copied into one on the way in and back out after the call.
     internal static bool IsBoxedStructByRef(Type managedType)
     {
-        return managedType.IsByRef && managedType.GetElementType()!.IsSubclassOf(typeof(Il2CppSystem.ValueType));
+        return managedType.IsByRef && IsWrappedStruct(managedType.GetElementType()!);
     }
 
     internal static IntPtr BoxStructAt(IntPtr klass, IntPtr data)
@@ -115,7 +126,7 @@ internal static class TrampolineHelpers
                 return typeof(IntPtr*);
             }
         }
-        else if (managedType.IsSubclassOf(typeof(Il2CppSystem.ValueType)) && IsPassedByValue(managedType))
+        else if (IsPassedByValue(managedType))
         {
             // A struct with no fields loses bytes on the way through a trampoline, a register sized one travels as an integer
             return ValueSize(managedType) switch
